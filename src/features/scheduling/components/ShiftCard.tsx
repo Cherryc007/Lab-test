@@ -1,6 +1,6 @@
-import { Shift, Site, Guard } from '../../types';
-import { ShiftStatus } from '../../types';
-import { StatusBadge, LoneWorkerBadge } from '../../components/ui/Badge';
+import { Shift, Site, Guard } from '../../../types';
+import { ShiftStatus } from '../../../types';
+import { StatusBadge, LoneWorkerBadge } from '../../../components/ui/Badge';
 
 interface ShiftCardProps {
   shift: Shift;
