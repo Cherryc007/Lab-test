@@ -111,6 +111,9 @@ guardon/
 │   ├── notifications/
 │   │   ├── components/            # NotificationBell, NotificationFeed
 │   │   └── types.ts
+│   ├── audit/
+│   │   ├── components/            # AuditLogViewer (future; no UI in MVP)
+│   │   └── types.ts
 │   └── dashboard/
 │       └── components/            # role-specific widgets, KpiCard, FillRateChart
 │
@@ -122,6 +125,7 @@ guardon/
 │   ├── useActivityLogStore.ts
 │   ├── useLoneWorkerStore.ts
 │   ├── useNotificationStore.ts
+│   ├── useAuditStore.ts           # append-only audit event log
 │   ├── useSessionStore.ts         # current user, role, simulated auth
 │   └── useUiStore.ts              # modals, toasts, global UI state
 │
@@ -133,6 +137,7 @@ guardon/
 │   ├── activityLogs.service.ts
 │   ├── loneWorker.service.ts
 │   ├── notifications.service.ts
+│   ├── audit.service.ts           # audit event persistence (mock: in-memory)
 │   └── client.ts                  # shared fetch-like helper: simulateLatency(), simulateFailure()
 │
 ├── mocks/                         # Fixture/seed data
@@ -167,11 +172,13 @@ guardon/
 
 Principles:
 
-1. **One store per domain**, matching the modules in FEATURE_BACKLOG.md (Scheduling, Attendance, Guards, Clients, Activity Logs, Lone Worker, Notifications) plus `useSessionStore` (current user/role — simulated auth) and `useUiStore` (modals, toasts, transient UI state).
+1. **One store per domain**, matching the modules in FEATURE_BACKLOG.md (Scheduling, Attendance, Guards, Clients, Activity Logs, Lone Worker, Notifications, Audit) plus `useSessionStore` (current user/role — simulated auth) and `useUiStore` (modals, toasts, transient UI state).
 2. **Stores expose actions, not setters.** Components call `store.acceptShift(shiftId)`, not `store.setShifts(...)`. The action internally calls the relevant service function, handles loading/error state, and updates the store. This keeps business logic out of components.
 3. **Derived state is computed via selectors**, not duplicated into the store. E.g., "open shifts" is derived from `shifts.filter(s => s.status === 'open')`, not maintained as a separate array that can drift out of sync.
 4. **Stores never import from `app/` or `components/`.** Dependency direction is strictly: UI → Store → Service → Mock Data.
 5. **Async actions follow a consistent shape:** `{ data, isLoading, error }` per resource, so loading/error UI patterns are consistent across the app and translate directly to real-world async query state (this shape is intentionally compatible with future adoption of a library like TanStack Query if desired in production).
+6. **Single entity ownership.** Each domain entity type is owned by exactly one store. That store is the sole source of truth for the entity's data and status transitions. Other stores that need to trigger a status change on a foreign entity do so through a dedicated, named transition function on the owning store (via `getState()`), never by holding a duplicate copy. This pattern prevents data drift between stores and creates auditable transition points.
+7. **Assignment history is first-class data.** Entities that pass through multiple actors (e.g., Shifts being assigned, rejected, reassigned) maintain an explicit event history (`ShiftAssignmentEvent[]`) alongside the current state, so the audit trail and dispatcher visibility into "who rejected this shift and when" are structurally guaranteed, not reconstructed after the fact.
 
 ---
 
@@ -181,14 +188,32 @@ Each module below is a `features/<name>` folder plus its corresponding store and
 
 | Module | Owns | Does Not Own |
 |---|---|---|
-| Scheduling | Shift CRUD, assignment, accept/reject, open shift marketplace | Attendance state (clock in/out), guard roster data |
-| Attendance | Clock in/out, GPS validation step, selfie capture step, attendance status | Shift creation/assignment |
-| Lone Worker | Check-in prompts, missed check-in detection, escalation | Activity log content (though check-ins may *include* a log entry) |
+| Scheduling | **Shift entity (sole owner)**: CRUD, status transitions across the full lifecycle (Draft → Completed), assignment, accept/reject, open shift marketplace, `ShiftAssignmentEvent` history. Exposes `transitionShiftStatus(shiftId, newStatus)` as the only approved cross-store write path for shift status changes. | Attendance records (clock in/out data), guard roster data |
+| Attendance | `AttendanceRecord` entity, clock in/out flows, GPS validation step, selfie capture step. Calls `useSchedulingStore.transitionShiftStatus()` to move a shift to `Active` (clock-in) or `Completed` (clock-out) — never holds or duplicates shift data. | Shift entity, shift creation/assignment |
+| Lone Worker | Check-in prompts, `LoneWorkerCheckIn` entity, missed check-in detection, `LoneWorkerAlert` entity, escalation | Activity log content (check-in `statusNote` is a safety signal owned here; formal operational logs are owned by Activity Logs) |
 | Activity Logs | Log submission, review queue, per-site history | Lone worker check-in scheduling |
 | Guards | Guard roster, profile, eligibility/availability | Shift assignment logic (Scheduling reads guard eligibility, but Guards module doesn't assign shifts) |
 | Clients | Client roster, site roster, geofence config | Attendance/GPS validation logic (Attendance reads site geofence, but doesn't own it) |
 | Notifications | In-app notification feed, read/unread state | The triggering business event itself (other modules raise notifications via a shared dispatch function) |
+| Audit | `AuditEntry` entity (append-only), audit event recording. Subscribes to state changes across domain stores and records who/what/when for every auditable action (see SECURITY_ACCESS.md §11). | Any source-of-truth business data; Audit is write-only from the perspective of other modules. |
 | Dashboard | Aggregation/presentation of metrics from other modules | Any source-of-truth data; Dashboard is read-only across modules |
+
+### Entity Ownership Map
+
+To prevent ambiguity, the following table makes entity-to-store ownership explicit:
+
+| Entity | Owning Store | Other Stores That Read It | Cross-Store Write Path |
+|---|---|---|---|
+| `Shift` | `useSchedulingStore` | Attendance, Lone Worker, Activity Logs, Dashboard | `transitionShiftStatus(shiftId, newStatus)` — called by Attendance on clock-in/clock-out |
+| `ShiftAssignmentEvent` | `useSchedulingStore` | Audit, Dashboard | None (Scheduling writes internally on assign/accept/reject/claim) |
+| `AttendanceRecord` | `useAttendanceStore` | Dashboard | None |
+| `Guard` | `useGuardStore` | Scheduling (eligibility), Dashboard | None |
+| `Client`, `Site` | `useClientStore` | Scheduling (site selection), Attendance (geofence), Dashboard | None |
+| `ActivityLog` | `useActivityLogStore` | Dashboard | None |
+| `LoneWorkerCheckIn`, `LoneWorkerAlert` | `useLoneWorkerStore` | Dashboard | None |
+| `Notification` | `useNotificationStore` | None | `pushNotification()` — called by other stores after their own state updates |
+| `AuditEntry` | `useAuditStore` | None | `recordEvent()` — called by other stores after auditable actions |
+| `User` (session) | `useSessionStore` | All stores (for current user context) | None |
 
 This boundary list is the basis for preventing "scattered business logic" — if a change touches scheduling rules, it should only require editing the Scheduling module's store/service/components.
 
@@ -227,10 +252,23 @@ Standard flow for any user action that mutates state:
 2. Component calls a store action (`useSchedulingStore.claimShift(shiftId)`).
 3. Store action sets `isLoading: true`, calls the corresponding service function (`schedulingService.claimShift(shiftId)`).
 4. Service function simulates network latency (`simulateLatency()`), reads/writes the in-memory mock database, and resolves with a result shaped like a real API response (`{ data, error }`).
-5. Store action updates state from the result, sets `isLoading: false`, and — where relevant — pushes a notification via `useNotificationStore`.
+5. Store action updates state from the result, sets `isLoading: false`, and — where relevant — pushes a notification via `useNotificationStore` and records an audit entry via `useAuditStore`.
 6. Components subscribed to that store slice re-render automatically via Zustand.
 
 This flow is intentionally identical in shape to what a real REST integration would look like, so step 4 is the only step that changes when the mock layer is replaced.
+
+### Cross-Store Transition Flow (Clock-In Example)
+
+When an action in one module must change an entity owned by another module, the flow extends with a controlled cross-store call:
+
+1. Guard taps "Clock In" → component calls `useAttendanceStore.clockIn(shiftId)`.
+2. Attendance store validates GPS + selfie, creates an `AttendanceRecord`.
+3. Attendance store calls `useSchedulingStore.getState().transitionShiftStatus(shiftId, 'Active')` — the single approved cross-store write path.
+4. Scheduling store validates the transition is legal (e.g., shift must be in `Confirmed` status), updates the shift, and appends a `ShiftAssignmentEvent` to the assignment history.
+5. Both stores record audit entries via `useAuditStore.getState().recordEvent()`.
+6. Components subscribed to either store re-render.
+
+This pattern keeps entity ownership unambiguous while allowing legitimate cross-domain workflows. The `transitionShiftStatus` function is the **only** code path that can change a shift's status from outside the Scheduling module — it is auditable, type-safe, and validates the transition before applying it.
 
 ---
 

@@ -73,6 +73,36 @@ Legend: **F** = Full (create/read/update/delete within scope), **R** = Read only
 - **Site-scoped authorization** for Supervisors and Client Contacts is modeled as an explicit assignment relationship (`supervisorAssignments`, `clientSiteAccess`), not inferred from naming conventions or convention-based queries.
 - Future consideration: move from pure RBAC toward attribute-based rules where useful (e.g., a Supervisor's access to a site can change dynamically based on active assignment dates) — noted as a future scope item, not required for MVP.
 
+### Permission Model Structure
+
+The permission matrix in §2 uses four access levels: **F** (full CRUD), **R** (read-only), **S** (scoped to self/assigned), **–** (no access). The implementation models these as two orthogonal dimensions rather than a flat boolean:
+
+```
+PermissionAction:  Create | Read | Update | Delete
+PermissionScope:   All | AssignedSites | Self | None
+
+PermissionGrant = { action: PermissionAction, scope: PermissionScope }
+```
+
+**Mapping from the §2 matrix legend to the type system:**
+
+| Matrix Symbol | PermissionAction | PermissionScope | Example |
+|---|---|---|---|
+| **F** (Full) | Create, Read, Update, Delete | All | Dispatcher: full schedule access |
+| **R** (Read) | Read | All (or AssignedSites for scoped roles) | Supervisor: read schedule for assigned sites |
+| **S** (Scoped to self/assigned) | Varies per capability | Self or AssignedSites | Guard: read/write own shifts only |
+| **–** (No access) | None | None | Client Contact: no access to guard roster |
+
+**How permission checks work:**
+
+1. **UI-level (`RoleGate` component):** Checks `canAccess(role, capability)` which returns a `PermissionGrant`. If `grant.scope === None`, the UI element is hidden. Otherwise it is rendered, and the scope informs whether scoped filtering is needed.
+2. **Data-access-level (service layer / future API):** After confirming the action is allowed, the scope is applied:
+   - `Scope.All` — no filtering; return all matching data.
+   - `Scope.AssignedSites` — filter results to `user.supervisorSiteIds` or `user.clientContactSiteIds`.
+   - `Scope.Self` — filter results to `entityOwnerId === currentUser.id` (e.g., guard sees only their own shifts).
+
+This two-dimensional model ensures the type system **forces** callers to consider scope, rather than relying on developers to remember ad-hoc filtering. A flat `hasPermission(role, capability): boolean` check would pass type-checking but silently skip scope enforcement — the structured model prevents this class of bug by making scope a required part of the return type.
+
 ---
 
 ## 5. Security Principles
@@ -179,4 +209,15 @@ Production must maintain an audit trail — separate from regular application da
 - **Permission/role changes:** any change to a user's role or site assignment, including who made the change.
 - **Activity log review actions:** who reviewed/approved a guard's activity log entry and when.
 
-Audit log entries should be **append-only** (not editable or deletable through normal application flows) given their evidentiary role in client billing disputes and potential compliance inquiries. The prototype does not yet implement a real audit log (there's no persistent backend to write one to), but the Mock Service Layer's action-logging pattern (see TECH_ARCHITECTURE.md §9) is structured so that adding real audit persistence later is additive, not a redesign.
+Audit log entries should be **append-only** (not editable or deletable through normal application flows) given their evidentiary role in client billing disputes and potential compliance inquiries.
+
+### Implementation Model
+
+The audit trail is implemented as a first-class domain module (see TECH_ARCHITECTURE.md §3, §5):
+
+- **`AuditEntry` entity:** `{ id, timestamp, actorId, actorRole, action, entityType, entityId, metadata?, siteId? }` — captures who did what, to which entity, when, and in what context.
+- **`useAuditStore`:** An append-only Zustand store that holds audit entries in memory for the prototype session. Entries are never modified or deleted through any store action.
+- **`audit.service.ts`:** Persists audit entries (mock: in-memory array; production: append-only database table or dedicated audit log service).
+- **Recording pattern:** Domain stores call `useAuditStore.getState().recordEvent()` after completing auditable actions. This is a deliberate direct call (not an event subscription) for the prototype, ensuring audit recording is explicit and traceable in the code. The call happens **after** the primary state update, so audit recording failures cannot block the primary workflow.
+
+**Schedule change audit trail** is further supported by the `ShiftAssignmentEvent` entity (see TECH_ARCHITECTURE.md §5 Entity Ownership Map), which maintains a per-shift history of all assignment actions (assigned, accepted, rejected, claimed, reassigned) with the acting user and timestamp. This provides both the audit trail required here and the dispatcher-facing visibility into shift assignment history (e.g., “who rejected this shift before it became open?”).
